@@ -9,13 +9,14 @@ from typing import Dict, List, Optional, Tuple, Any
 import torch
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
-import torch.nn.functional as F
 from tqdm import tqdm
 import logging
 import json
-import os
 from contextlib import nullcontext
 from pathlib import Path
+
+from .losses import NGNLoss
+from .stability import GradientMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +41,19 @@ class NGNTrainer:
         device: str = 'cuda',
         log_dir: str = 'logs/',
         gradient_clip_norm: float = 1.0,
-        use_mixed_precision: bool = False
+        use_mixed_precision: bool = False,
+        loss_fn: Optional[NGNLoss] = None,
+        gradient_monitor_interval: int = 50,
+        gradient_monitor_threshold: float = 10.0
     ):
         self.model = model.to(device)
         self.optimizer = optimizer
         self.device = device
         self.gradient_clip_norm = gradient_clip_norm
         self.use_mixed_precision = use_mixed_precision
+        self.loss_fn = loss_fn or NGNLoss()
+        self.gradient_monitor_interval = gradient_monitor_interval
+        self.gradient_monitor_threshold = gradient_monitor_threshold
 
         # Logging setup
         self.log_dir = Path(log_dir)
@@ -61,6 +68,7 @@ class NGNTrainer:
         # Stability monitoring
         self.gradient_norms = []
         self.layer_gradient_norms = []
+        self.gradient_monitor = GradientMonitor(self.model)
 
     def train_epoch(
         self,
@@ -82,6 +90,7 @@ class NGNTrainer:
         self.model.train()
         total_loss = 0.0
         total_accuracy = 0.0
+        component_totals: Dict[str, float] = {}
         num_batches = len(dataloader)
 
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
@@ -92,14 +101,12 @@ class NGNTrainer:
             # Forward pass
             with torch.cuda.amp.autocast() if self.scaler else nullcontext():
                 logits, debug_info = self.model(x)
-                loss = F.cross_entropy(logits, y)
-
-                # Add regularization if attention weights available
-                if 'attention_weights' in debug_info:
-                    entropy_reg = self._compute_attention_entropy_regularization(
-                        debug_info['attention_weights']
-                    )
-                    loss = loss + 0.1 * entropy_reg
+                loss, loss_components = self.loss_fn(
+                    logits=logits,
+                    targets=y,
+                    debug_info=debug_info,
+                    model=self.model
+                )
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -114,6 +121,8 @@ class NGNTrainer:
                     self.gradient_clip_norm
                 )
 
+                self._check_gradients()
+
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
@@ -124,6 +133,8 @@ class NGNTrainer:
                     self.model.parameters(),
                     self.gradient_clip_norm
                 )
+
+                self._check_gradients()
 
                 self.optimizer.step()
 
@@ -141,11 +152,13 @@ class NGNTrainer:
             # Update totals
             total_loss += loss.item()
             total_accuracy += accuracy
+            for key, value in loss_components.items():
+                component_totals[key] = component_totals.get(key, 0.0) + value
 
             # Log batch metrics
             if batch_idx % log_every == 0:
                 self._log_batch_metrics(
-                    loss.item(), accuracy, debug_info, epoch, batch_idx
+                    loss.item(), accuracy, loss_components, debug_info, epoch, batch_idx
                 )
 
             # Update progress bar
@@ -167,6 +180,8 @@ class NGNTrainer:
             'accuracy': epoch_accuracy,
             'step': self.global_step
         }
+        for key, value in component_totals.items():
+            epoch_metrics[key] = value / num_batches
         self.metrics_history.append(epoch_metrics)
         self._save_metrics()
 
@@ -202,7 +217,7 @@ class NGNTrainer:
                 x, y = x.to(self.device), y.to(self.device)
 
                 logits, _ = self.model(x)
-                loss = F.cross_entropy(logits, y)
+                loss, _ = self.loss_fn(logits=logits, targets=y, debug_info=None, model=None)
 
                 preds = logits.argmax(dim=1)
                 if y.dim() > 1 and y.size(1) > 1:
@@ -240,6 +255,7 @@ class NGNTrainer:
         self,
         loss: float,
         accuracy: float,
+        loss_components: Dict[str, float],
         debug_info: Dict[str, Any],
         epoch: int,
         batch_idx: int
@@ -247,7 +263,13 @@ class NGNTrainer:
         """Log detailed batch metrics."""
         # Log basic metrics
         if batch_idx % 50 == 0:  # Log less frequently for batch metrics
-            logger.debug(f"Batch {batch_idx}: Loss={loss:.4f}, Acc={accuracy:.4f}")
+            logger.debug(
+                "Batch %s: Loss=%.4f, Acc=%.4f, Components=%s",
+                batch_idx,
+                loss,
+                accuracy,
+                {k: f"{v:.4f}" for k, v in loss_components.items()}
+            )
 
         # Log gradient norms if available
         if hasattr(self.model, 'parameters'):
@@ -263,37 +285,15 @@ class NGNTrainer:
                 logger.warning(f"Large gradient norm: {total_norm:.4f} at step {self.global_step}")
 
         # Log attention weights statistics if available
-        if 'attention_weights' in debug_info:
+        if 'attention_weights' in debug_info and batch_idx % 50 == 0:
             attn_weights = debug_info['attention_weights']
-            if isinstance(attn_weights, list) and len(attn_weights) > 0:
-                # Compute entropy of attention distributions
-                entropy = self._compute_attention_entropy(attn_weights[0])
-                if batch_idx % 50 == 0:
-                    logger.debug(f"Attention entropy: {entropy:.4f}")
-
-    def _compute_attention_entropy_regularization(self, attention_weights: List[Tensor]) -> Tensor:
-        """Compute entropy regularization for attention weights."""
-        total_entropy = 0.0
-
-        for attn in attention_weights:
-            if isinstance(attn, list):
-                attn = attn[0]  # Take first head if multi-head
-
-            # Compute entropy: -sum(p * log(p))
-            entropy = -torch.sum(attn * torch.log(attn + 1e-8), dim=-1).mean()
-            total_entropy += entropy
-
-        return total_entropy / len(attention_weights)
-
-    def _compute_attention_entropy(self, attention_weights: Tensor) -> float:
-        """Compute average entropy of attention weights."""
-        # attention_weights shape: (batch, num_heads, seq_len, seq_len)
-        entropy = -torch.sum(
-            attention_weights * torch.log(attention_weights + 1e-8),
-            dim=-1
-        ).mean().item()
-
-        return entropy
+            if isinstance(attn_weights, list):
+                sample = attn_weights[0]
+            else:
+                sample = attn_weights
+            if isinstance(sample, Tensor):
+                entropy = -torch.sum(sample * torch.log(sample + 1e-8), dim=-1).mean().item()
+                logger.debug("Attention entropy: %.4f", entropy)
 
     def save_checkpoint(self, path: str, epoch: int, metrics: Dict[str, float]):
         """Save model checkpoint."""
@@ -334,3 +334,15 @@ class NGNTrainer:
                 json.dump(self.metrics_history, f, indent=2)
         except Exception as e:
             logger.warning(f"Failed to save metrics: {e}")
+
+    def _check_gradients(self) -> None:
+        if self.gradient_monitor_interval <= 0:
+            return
+        if self.global_step % self.gradient_monitor_interval != 0:
+            return
+        stats = self.gradient_monitor.record_gradients()
+        self.gradient_norms.append(stats['total_norm'])
+        self.layer_gradient_norms.append(stats['layer_norms'])
+        warnings = self.gradient_monitor.check_stability(self.gradient_monitor_threshold)
+        for warning in warnings:
+            logger.warning("Gradient warning at step %s: %s", self.global_step, warning)

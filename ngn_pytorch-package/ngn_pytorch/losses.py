@@ -24,8 +24,9 @@ class NGNLoss(nn.Module):
     def __init__(
         self,
         classification_weight: float = 1.0,
-        attention_entropy_weight: float = 0.1,
-        sparsity_weight: float = 0.01,
+        attention_entropy_weight: float = 0.05,
+        sparsity_weight: float = 0.005,
+        adjacency_entropy_weight: float = 0.0,
         gradient_penalty_weight: float = 0.0
     ):
         super().__init__()
@@ -33,6 +34,7 @@ class NGNLoss(nn.Module):
         self.classification_weight = classification_weight
         self.attention_entropy_weight = attention_entropy_weight
         self.sparsity_weight = sparsity_weight
+        self.adjacency_entropy_weight = adjacency_entropy_weight
         self.gradient_penalty_weight = gradient_penalty_weight
 
         self.classification_loss = nn.CrossEntropyLoss()
@@ -67,20 +69,25 @@ class NGNLoss(nn.Module):
         }
 
         # Attention entropy regularization
-        if debug_info and 'attention_weights' in debug_info:
-            entropy_reg = self._compute_attention_entropy_regularization(
-                debug_info['attention_weights']
-            )
+        if debug_info and ('gated_attention_weights' in debug_info or 'attention_weights' in debug_info):
+            attention_source = debug_info.get('gated_attention_weights', debug_info.get('attention_weights'))
+            entropy_reg = self._compute_attention_entropy_regularization(attention_source)
             total_loss += self.attention_entropy_weight * entropy_reg
             loss_components['attention_entropy'] = entropy_reg.item()
 
         # Graph sparsity regularization
-        if debug_info and 'adjacency_matrix' in debug_info:
-            sparsity_reg = self._compute_sparsity_regularization(
-                debug_info['adjacency_matrix']
-            )
+        if debug_info and ('adjacency_gate' in debug_info or 'adjacency_matrix' in debug_info):
+            adjacency_source = debug_info.get('adjacency_gate', debug_info.get('adjacency_matrix'))
+            sparsity_reg = self._compute_sparsity_regularization(adjacency_source)
             total_loss += self.sparsity_weight * sparsity_reg
             loss_components['sparsity'] = sparsity_reg.item()
+
+        if debug_info and self.adjacency_entropy_weight > 0:
+            adjacency_source = debug_info.get('adjacency_gate', debug_info.get('adjacency_matrix'))
+            if adjacency_source is not None:
+                adjacency_entropy = self._compute_adjacency_entropy(adjacency_source)
+                total_loss += self.adjacency_entropy_weight * adjacency_entropy
+                loss_components['adjacency_entropy'] = adjacency_entropy.item()
 
         # Gradient penalty (if model provided)
         if model is not None and self.gradient_penalty_weight > 0:
@@ -92,7 +99,7 @@ class NGNLoss(nn.Module):
 
         return total_loss, loss_components
 
-    def _compute_attention_entropy_regularization(self, attention_weights: List[Tensor]) -> Tensor:
+    def _compute_attention_entropy_regularization(self, attention_weights: Tensor | List[Tensor]) -> Tensor:
         """
         Encourage diverse attention distributions.
 
@@ -102,24 +109,25 @@ class NGNLoss(nn.Module):
         total_entropy = 0.0
         num_weights = 0
 
-        for attn in attention_weights:
-            if isinstance(attn, list):
-                # Multi-head attention
-                for head_attn in attn:
-                    entropy = -torch.sum(
-                        head_attn * torch.log(head_attn + 1e-8),
-                        dim=-1
-                    ).mean()
-                    total_entropy += entropy
-                    num_weights += 1
-            else:
-                # Single attention matrix
+        if isinstance(attention_weights, list):
+            weights_list = attention_weights
+        else:
+            weights_list = [attention_weights]
+
+        for attn in weights_list:
+            if attn.dim() == 4:
+                # (batch, heads, target, source)
                 entropy = -torch.sum(
                     attn * torch.log(attn + 1e-8),
                     dim=-1
                 ).mean()
-                total_entropy += entropy
-                num_weights += 1
+            else:
+                entropy = -torch.sum(
+                    attn * torch.log(attn + 1e-8),
+                    dim=-1
+                ).mean()
+            total_entropy += entropy
+            num_weights += 1
 
         return total_entropy / max(num_weights, 1)
 
@@ -130,6 +138,14 @@ class NGNLoss(nn.Module):
         L1 penalty on adjacency weights promotes selective connections.
         """
         return torch.abs(adjacency_matrix).sum()
+
+    def _compute_adjacency_entropy(self, adjacency_matrix: Tensor) -> Tensor:
+        gate = adjacency_matrix
+        if gate.dim() != 2:
+            raise ValueError("Adjacency matrix must be 2D.")
+        probs = gate / gate.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1).mean()
+        return entropy
 
     def _compute_gradient_penalty(self, model: nn.Module) -> Tensor:
         """

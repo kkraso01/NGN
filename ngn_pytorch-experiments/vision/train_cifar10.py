@@ -5,19 +5,22 @@ Train NGN-ResNet on CIFAR-10 to validate the approach on real vision data.
 """
 
 import torch
-from torch import nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as transforms
 import logging
 from pathlib import Path
 from typing import Tuple
+import random
+import numpy as np
+import json
 
-from ngn_pytorch.backbones.cnn_backbone import NGNResNet
-from ngn_pytorch.core.communication import SharedAttentionAggregator
-from ngn_pytorch.training.trainer import NGNTrainer
-from ngn_pytorch.utils.visualization import NGNVisualizer
+from ngn_pytorch.cnn_backbone import NGNResNet, IdentityLayerGraph
+from ngn_pytorch.communication import SharedAttentionAggregator
+from ngn_pytorch.graph import StaticLayerGraph
+from ngn_pytorch.losses import NGNLoss
+from ngn_pytorch.trainer import NGNTrainer
+from ngn_pytorch.visualization import NGNVisualizer
 
 logger = logging.getLogger(__name__)
 
@@ -60,15 +63,30 @@ def get_cifar10_dataloaders(
     return train_loader, val_loader
 
 
-def create_ngn_resnet_model(num_classes: int = 10) -> NGNResNet:
+def set_seed(seed: int, deterministic: bool = False) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def create_ngn_resnet_model(
+    num_classes: int = 10,
+    num_heads: int = 8,
+    use_residual: bool = True
+) -> NGNResNet:
     """Create NGN-ResNet model for CIFAR-10."""
 
     # Create layer graph
     layer_graph = SharedAttentionAggregator(
         num_layers=4,  # ResNet-18 has 4 layer groups
         feature_dims=[64, 128, 256, 512],
-        num_heads=8,
-        dropout=0.1
+        num_heads=num_heads,
+        dropout=0.1,
+        use_residual=use_residual
     )
 
     # Create NGN-ResNet
@@ -86,8 +104,6 @@ def create_baseline_resnet_model(num_classes: int = 10) -> NGNResNet:
     """Create baseline ResNet model (no NGN)."""
 
     # Identity layer graph (no communication)
-    from ngn_pytorch.backbones.cnn_backbone import IdentityLayerGraph
-
     layer_graph = IdentityLayerGraph(
         num_layers=4,
         feature_dims=[64, 128, 256, 512]
@@ -112,7 +128,14 @@ def train_cifar10_experiment(
     log_dir: str = 'logs/cifar10',
     ablation: str = 'dynamic',
     num_heads: int = 8,
-    use_residual: bool = True
+    use_residual: bool = True,
+    attention_entropy_weight: float = 0.05,
+    adjacency_sparsity_weight: float = 0.005,
+    adjacency_entropy_weight: float = 0.0,
+    gradient_clip_norm: float = 1.0,
+    gradient_monitor_interval: int = 50,
+    seed: int = 42,
+    deterministic: bool = False
 ):
     """
     Train CIFAR-10 experiment.
@@ -126,14 +149,37 @@ def train_cifar10_experiment(
         log_dir: Logging directory
     """
 
+    set_seed(seed, deterministic)
+
+    config = {
+        'model_name': model_name,
+        'num_epochs': num_epochs,
+        'batch_size': batch_size,
+        'learning_rate': learning_rate,
+        'weight_decay': weight_decay,
+        'ablation': ablation,
+        'num_heads': num_heads,
+        'use_residual': use_residual,
+        'attention_entropy_weight': attention_entropy_weight,
+        'adjacency_sparsity_weight': adjacency_sparsity_weight,
+        'adjacency_entropy_weight': adjacency_entropy_weight,
+        'gradient_clip_norm': gradient_clip_norm,
+        'gradient_monitor_interval': gradient_monitor_interval,
+        'seed': seed,
+        'deterministic': deterministic
+    }
+    logger.info("Run configuration: %s", config)
+    log_dir_path = Path(log_dir)
+    log_dir_path.mkdir(parents=True, exist_ok=True)
+    with (log_dir_path / 'config.json').open('w') as config_file:
+        json.dump(config, config_file, indent=2)
+
     # Get data
     train_loader, val_loader = get_cifar10_dataloaders(batch_size)
 
     # Create model
     if ablation == 'static':
-        # Static learned graph (no input-dependent attention)
-        from ngn_pytorch.core.graph import LayerGraph
-        layer_graph = LayerGraph(
+        layer_graph = StaticLayerGraph(
             num_layers=4,
             feature_dims=[64, 128, 256, 512],
             use_residual=use_residual,
@@ -147,13 +193,12 @@ def train_cifar10_experiment(
         )
         logger.info("Created static LayerGraph ResNet18 model")
     elif ablation == 'dynamic':
-        # Dynamic attention-based graph
-        from ngn_pytorch.core.communication import SharedAttentionAggregator
         layer_graph = SharedAttentionAggregator(
             num_layers=4,
             feature_dims=[64, 128, 256, 512],
             num_heads=num_heads,
-            dropout=0.1
+            dropout=0.1,
+            use_residual=use_residual
         )
         model = NGNResNet(
             backbone_name='resnet18',
@@ -162,25 +207,18 @@ def train_cifar10_experiment(
             layer_graph=layer_graph
         )
         logger.info(f"Created NGN-ResNet18 model (dynamic, heads={num_heads}, residual={use_residual})")
-    elif ablation == 'residual_off':
-        # Dynamic attention, no residual
-        from ngn_pytorch.core.communication import SharedAttentionAggregator
-        layer_graph = SharedAttentionAggregator(
+    elif ablation == 'identity':
+        layer_graph = IdentityLayerGraph(
             num_layers=4,
-            feature_dims=[64, 128, 256, 512],
-            num_heads=num_heads,
-            dropout=0.1
+            feature_dims=[64, 128, 256, 512]
         )
-        # Patch to disable residuals if supported
-        if hasattr(layer_graph, 'use_residual'):
-            layer_graph.use_residual = False
         model = NGNResNet(
             backbone_name='resnet18',
             num_classes=10,
             pretrained=False,
             layer_graph=layer_graph
         )
-        logger.info(f"Created NGN-ResNet18 model (dynamic, heads={num_heads}, residual=OFF)")
+        logger.info("Created identity LayerGraph ResNet18 model")
     else:
         # Baseline
         model = create_baseline_resnet_model()
@@ -204,7 +242,13 @@ def train_cifar10_experiment(
         optimizer=optimizer,
         device=device,
         log_dir=log_dir,
-        gradient_clip_norm=1.0
+        gradient_clip_norm=gradient_clip_norm,
+        loss_fn=NGNLoss(
+            attention_entropy_weight=attention_entropy_weight,
+            sparsity_weight=adjacency_sparsity_weight,
+            adjacency_entropy_weight=adjacency_entropy_weight
+        ),
+        gradient_monitor_interval=gradient_monitor_interval
     )
 
     # Visualizer
@@ -347,11 +391,21 @@ if __name__ == '__main__':
         Path(dir_name).mkdir(exist_ok=True)
 
     parser = argparse.ArgumentParser(description="CIFAR-10 NGN Ablation Experiments")
-    parser.add_argument('--ablation', type=str, default='dynamic', choices=['dynamic', 'static', 'residual_off', 'baseline'], help='Ablation type')
+    parser.add_argument('--ablation', type=str, default='dynamic', choices=['baseline', 'identity', 'static', 'dynamic'], help='Ablation type')
     parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads (if dynamic)')
     parser.add_argument('--no_residual', action='store_true', help='Disable residual connections')
     parser.add_argument('--epochs', type=int, default=2, help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
+    parser.add_argument('--learning_rate', type=float, default=0.1, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=5e-4, help='Weight decay')
+    parser.add_argument('--log_dir', type=str, default='logs/cifar10', help='Log directory')
+    parser.add_argument('--attention_entropy_weight', type=float, default=0.05, help='Attention entropy regularization weight')
+    parser.add_argument('--adjacency_sparsity_weight', type=float, default=0.005, help='Adjacency sparsity regularization weight')
+    parser.add_argument('--adjacency_entropy_weight', type=float, default=0.0, help='Adjacency entropy regularization weight')
+    parser.add_argument('--gradient_clip_norm', type=float, default=1.0, help='Gradient clipping norm')
+    parser.add_argument('--gradient_monitor_interval', type=int, default=50, help='Gradient monitoring interval')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--deterministic', action='store_true', help='Enable deterministic CuDNN')
     args = parser.parse_args()
 
     use_residual = not args.no_residual
@@ -361,7 +415,17 @@ if __name__ == '__main__':
         batch_size=args.batch_size,
         ablation=args.ablation,
         num_heads=args.num_heads,
-        use_residual=use_residual
+        use_residual=use_residual,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        log_dir=args.log_dir,
+        attention_entropy_weight=args.attention_entropy_weight,
+        adjacency_sparsity_weight=args.adjacency_sparsity_weight,
+        adjacency_entropy_weight=args.adjacency_entropy_weight,
+        gradient_clip_norm=args.gradient_clip_norm,
+        gradient_monitor_interval=args.gradient_monitor_interval,
+        seed=args.seed,
+        deterministic=args.deterministic
     )
     print("CIFAR-10 Experiment Results:")
     print(f"Best Accuracy: {results['best_accuracy']:.4f}")

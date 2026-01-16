@@ -73,7 +73,7 @@ class LayerGraph(nn.Module, ABC):
 
     def get_adjacency_matrix(self) -> Tensor:
         """Return the current learned adjacency matrix."""
-        return self.adjacency.detach()
+        return self.adjacency
 
     def get_sparsity_mask(self, threshold: float = 0.1) -> Tensor:
         """
@@ -127,3 +127,80 @@ class LayerGraph(nn.Module, ABC):
                 raise ValueError(f"Unsupported tensor dimension: {refined.dim()}. Expected 2D or 4D.")
 
         return refined
+
+
+class StaticLayerGraph(LayerGraph):
+    """
+    Static layer graph that uses learned adjacency for message passing.
+
+    This graph performs a simple, stable update by pooling each layer to a
+    layer-level token, mixing tokens via the adjacency matrix, and projecting
+    updates back to each layer.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        feature_dims: List[int],
+        embed_dim: Optional[int] = None,
+        use_residual: bool = True,
+        use_layer_norm: bool = True
+    ) -> None:
+        super().__init__(
+            num_layers=num_layers,
+            feature_dims=feature_dims,
+            use_residual=use_residual,
+            use_layer_norm=use_layer_norm
+        )
+
+        self.embed_dim = embed_dim or feature_dims[0]
+
+        self.input_projections = nn.ModuleList([
+            nn.Linear(dim, self.embed_dim) if dim != self.embed_dim else nn.Identity()
+            for dim in feature_dims
+        ])
+        self.output_projections = nn.ModuleList([
+            nn.Linear(self.embed_dim, dim) for dim in feature_dims
+        ])
+
+    def forward(
+        self,
+        layer_outputs: List[Tensor]
+    ) -> Tuple[List[Tensor], Dict[str, Tensor]]:
+        assert len(layer_outputs) == self.num_layers, \
+            f"Expected {self.num_layers} layer outputs, got {len(layer_outputs)}"
+
+        tokens = []
+        for i, feat in enumerate(layer_outputs):
+            if feat.dim() == 4:
+                pooled = feat.mean(dim=(2, 3))
+            elif feat.dim() == 2:
+                pooled = feat
+            else:
+                raise ValueError(f"Unsupported tensor dimension: {feat.dim()}. Expected 2D or 4D.")
+            tokens.append(self.input_projections[i](pooled))
+
+        stacked_tokens = torch.stack(tokens, dim=1)  # (batch, layers, embed_dim)
+
+        adjacency_gate = torch.sigmoid(self.adjacency)
+        denom = adjacency_gate.sum(dim=0).clamp_min(1e-6)
+        update_tokens = torch.einsum('ji,bje->bie', adjacency_gate, stacked_tokens)
+        update_tokens = update_tokens / denom.unsqueeze(0).unsqueeze(-1)
+
+        refined_outputs = []
+        for i, feat in enumerate(layer_outputs):
+            update_token = self.output_projections[i](update_tokens[:, i])
+            if feat.dim() == 4:
+                update = update_token[:, :, None, None].expand_as(feat)
+            else:
+                update = update_token
+            refined = self.apply_residual_connection(feat, update, i)
+            refined_outputs.append(refined)
+
+        debug_info = {
+            'adjacency_matrix': self.adjacency,
+            'adjacency_gate': adjacency_gate,
+            'communication_type': 'static'
+        }
+
+        return refined_outputs, debug_info

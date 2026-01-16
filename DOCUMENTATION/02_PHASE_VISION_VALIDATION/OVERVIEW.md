@@ -113,6 +113,37 @@
 
 ---
 
+## 🧪 Quick Runbook
+
+### Install (editable)
+```bash
+cd ngn_pytorch-package
+pip install -e .
+```
+
+### Run CIFAR-10 (dynamic)
+```bash
+python ngn_pytorch-experiments/vision/train_cifar10.py --ablation dynamic --seed 42
+```
+
+### Run baseline / identity / static
+```bash
+python ngn_pytorch-experiments/vision/train_cifar10.py --ablation identity --seed 42
+python ngn_pytorch-experiments/vision/train_cifar10.py --ablation static --seed 42
+python ngn_pytorch-experiments/vision/train_cifar10.py --ablation baseline --seed 42
+```
+
+### Import Paths
+```python
+from ngn_pytorch.cnn_backbone import NGNResNet, IdentityLayerGraph
+from ngn_pytorch.communication import SharedAttentionAggregator
+from ngn_pytorch.graph import StaticLayerGraph
+from ngn_pytorch.trainer import NGNTrainer
+from ngn_pytorch.visualization import NGNVisualizer
+```
+
+---
+
 ## 📊 Attention Analysis
 
 ### Layer Connectivity Learned
