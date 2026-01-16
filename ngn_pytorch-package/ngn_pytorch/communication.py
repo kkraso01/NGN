@@ -35,6 +35,7 @@ class SharedAttentionAggregator(LayerGraph):
         feature_dims: List[int],
         num_heads: int = 8,
         dropout: float = 0.1,
+        embed_dim: Optional[int] = None,
         use_residual: bool = True,
         use_layer_norm: bool = True
     ) -> None:
@@ -45,31 +46,23 @@ class SharedAttentionAggregator(LayerGraph):
             use_layer_norm=use_layer_norm
         )
 
-        # Assume all layers have the same feature dimension for simplicity
-        # In practice, we might need projection layers for different dims
-        embed_dim = feature_dims[0]  # Use first layer's dimension as reference
+        self.embed_dim = embed_dim or feature_dims[0]
 
         # Shared multi-head attention module used by all layers
         self.shared_attention = nn.MultiheadAttention(
-            embed_dim=embed_dim,
+            embed_dim=self.embed_dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True
         )
 
-        # Optional projection layers if feature dimensions differ
-        self.projections = nn.ModuleList()
-        for dim in feature_dims:
-            if dim != embed_dim:
-                self.projections.append(nn.Linear(dim, embed_dim))
-            else:
-                self.projections.append(nn.Identity())
-
-        # Update layer norms for the shared embed_dim
-        if self.use_layer_norm:
-            self.layer_norms = nn.ModuleList([
-                nn.LayerNorm(embed_dim) for _ in feature_dims
-            ])
+        self.input_projections = nn.ModuleList([
+            nn.Linear(dim, self.embed_dim) if dim != self.embed_dim else nn.Identity()
+            for dim in feature_dims
+        ])
+        self.output_projections = nn.ModuleList([
+            nn.Linear(self.embed_dim, dim) for dim in feature_dims
+        ])
 
     def forward(
         self,
@@ -90,69 +83,56 @@ class SharedAttentionAggregator(LayerGraph):
             f"Expected {self.num_layers} layer outputs, got {len(layer_outputs)}"
 
         # Project all layer outputs to common dimension if needed
-        projected_outputs = []
+        tokens = []
         for i, feat in enumerate(layer_outputs):
-            proj_feat = self.projections[i](feat.flatten(2).transpose(1, 2))
-            projected_outputs.append(proj_feat)
+            if feat.dim() == 4:
+                pooled = feat.mean(dim=(2, 3))
+            elif feat.dim() == 2:
+                pooled = feat
+            else:
+                raise ValueError(f"Unsupported tensor dimension: {feat.dim()}. Expected 2D or 4D.")
+            tokens.append(self.input_projections[i](pooled))
 
-        # Stack all layer features for attention
-        # Shape: (batch_size, num_layers, embed_dim)
-        stacked_features = torch.stack(projected_outputs, dim=1)
+        stacked_tokens = torch.stack(tokens, dim=1)  # (batch, num_layers, embed_dim)
+
+        _, attn_weights = self.shared_attention(
+            query=stacked_tokens,
+            key=stacked_tokens,
+            value=stacked_tokens,
+            need_weights=True,
+            average_attn_weights=False
+        )
+
+        adjacency_gate = torch.sigmoid(self.adjacency)
+        gate_for_attention = adjacency_gate.transpose(0, 1)
+
+        gated_weights = attn_weights * gate_for_attention.unsqueeze(0).unsqueeze(0)
+        gated_weights = gated_weights / gated_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        gated_output = torch.einsum('bhij,bje->bhie', gated_weights, stacked_tokens)
+        gated_output = gated_output.mean(dim=1)
 
         refined_outputs = []
-        attention_weights_list = []
+        for i, feat in enumerate(layer_outputs):
+            update_token = self.output_projections[i](gated_output[:, i])
+            if feat.dim() == 4:
+                update = update_token[:, :, None, None].expand_as(feat)
+            else:
+                update = update_token
 
-        # For each layer, attend to all other layers
-        for i in range(self.num_layers):
-            # Query: current layer features
-            query = projected_outputs[i].unsqueeze(1)  # (batch, 1, embed_dim)
-
-            # Keys and values: all layer features
-            keys_values = stacked_features  # (batch, num_layers, embed_dim)
-
-            # Apply attention
-            attn_output, attn_weights = self.shared_attention(
-                query=query,
-                key=keys_values,
-                value=keys_values
-            )
-
-            # Remove the singleton dimension
-            attn_output = attn_output.squeeze(1)  # (batch, embed_dim)
-
-            # Reshape back to spatial dimensions (assuming we can infer)
-            # This is a simplification; in practice, we need to handle spatial dims
-            batch_size, seq_len, embed_dim = attn_output.shape
-            # Assume square spatial dimension for simplicity
-            spatial_size = int((seq_len * embed_dim / layer_outputs[i].shape[1]) ** 0.5)
-            height = width = spatial_size
-
-            try:
-                attn_output_spatial = attn_output.view(
-                    batch_size, layer_outputs[i].shape[1], height, width
-                )
-            except RuntimeError:
-                # Fallback: use original spatial dimensions
-                original_h, original_w = layer_outputs[i].shape[2], layer_outputs[i].shape[3]
-                attn_output_spatial = attn_output.view(
-                    batch_size, layer_outputs[i].shape[1], original_h, original_w
-                )
-
-            # Apply residual connection and layer norm
             refined = self.apply_residual_connection(
                 original=layer_outputs[i],
-                update=attn_output_spatial,
+                update=update,
                 layer_idx=i
             )
-
             refined_outputs.append(refined)
-            attention_weights_list.append(attn_weights)
 
-        # Prepare debug information
         debug_info = {
-            'attention_weights': attention_weights_list,
-            'adjacency_matrix': self.get_adjacency_matrix(),
-            'sparsity_mask': self.get_sparsity_mask()
+            'attention_weights': attn_weights,
+            'gated_attention_weights': gated_weights,
+            'adjacency_matrix': self.adjacency,
+            'adjacency_gate': adjacency_gate,
+            'communication_type': 'dynamic'
         }
 
         return refined_outputs, debug_info

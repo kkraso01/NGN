@@ -63,7 +63,7 @@ class NGNVisualizer:
 
     def plot_attention_heatmap(
         self,
-        attention_weights: List[Tensor],
+        attention_weights: List[Tensor] | Tensor,
         epoch: int,
         batch_idx: Optional[int] = None,
         save: bool = True
@@ -80,7 +80,14 @@ class NGNVisualizer:
         Returns:
             filename: Path to saved plot
         """
-        if not attention_weights:
+        if attention_weights is None:
+            logger.warning("No attention weights to plot")
+            return ""
+
+        if isinstance(attention_weights, Tensor):
+            attention_weights = [attention_weights]
+
+        if len(attention_weights) == 0:
             logger.warning("No attention weights to plot")
             return ""
 
@@ -91,14 +98,10 @@ class NGNVisualizer:
             axes = [axes]
 
         for i, attn in enumerate(attention_weights):
-            # Handle different attention formats
-            if isinstance(attn, list):
-                # Multi-head attention
-                attn = attn[0]  # Use first head for visualization
-
-            # Convert to numpy and average over batch
             attn_np = attn.detach().cpu().numpy()
-            if attn_np.ndim == 3:  # (batch, seq_len, seq_len)
+            if attn_np.ndim == 4:  # (batch, heads, seq_len, seq_len)
+                attn_np = attn_np.mean(axis=(0, 1))
+            elif attn_np.ndim == 3:
                 attn_np = attn_np.mean(axis=0)
 
             # Plot heatmap

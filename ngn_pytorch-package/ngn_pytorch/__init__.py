@@ -49,7 +49,7 @@ __author__ = "NGN Research Team"
 __license__ = "MIT"
 
 # Core components
-from .graph import LayerGraph
+from .graph import LayerGraph, StaticLayerGraph
 from .communication import SharedAttentionAggregator, SharedRNNAggregator
 from .topology import DynamicRoutingGate, HierarchicalLayerGraph
 
@@ -78,6 +78,7 @@ from .profiling import NGNProfiler, benchmark_models, compare_ngn_to_baseline
 __all__ = [
     # Core
     'LayerGraph',
+    'StaticLayerGraph',
     'SharedAttentionAggregator',
     'SharedRNNAggregator',
     'DynamicRoutingGate',
